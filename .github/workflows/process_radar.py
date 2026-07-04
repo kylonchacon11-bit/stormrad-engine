@@ -12,26 +12,27 @@ def fetch_and_compile_latest_radar():
     s3 = boto3.client('s3', config=Config(signature_version=UNSIGNED))
     bucket_name = 'noaa-nexrad-level2'
     
+    # Targeting Houston (KHGX)
     station = 'KHGX'
     
+    # Look back 15 minutes to guarantee file availability
     now = datetime.utcnow() - timedelta(minutes=15)
     date_path = now.strftime('%Y/%m/%d')
     prefix = f"{date_path}/{station}/{station}"
     
-    print(f">>> Scanning directory path: {prefix}")
     objects = s3.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
     
     if 'Contents' not in objects:
-        print("!!! Error: No active radar updates found in this timeframe slot. Standby...")
+        print("!!! Error: No data found.")
         return
         
     latest_file_key = sorted(objects['Contents'], key=lambda x: x['LastModified'])[-1]['Key']
     local_binary_filename = 'raw_radar.bin'
     
-    print(f">>> Pulling raw file chunk down to container: {latest_file_key}")
+    print(f">>> Downloading: {latest_file_key}")
     s3.download_file(bucket_name, latest_file_key, local_binary_filename)
     
-    print(">>> Decoding NEXRAD Level II binary structures via PyArt...")
+    print(">>> Decoding NEXRAD Level II...")
     radar = pyart.io.read_nexrad_archive(local_binary_filename)
     
     sweep_slice = radar.get_slice(0)
@@ -41,12 +42,11 @@ def fetch_and_compile_latest_radar():
     
     features = []
     num_radials, num_gates = ref_field.shape
-    print(f">>> Scanning array matrix size: {num_radials} radials x {num_gates} gates")
     
-    for r in range(0, num_radials - 1, 2):
-        for g in range(0, num_gates - 1, 2):
+    # Downsample by 3 to ensure we stay under the memory limits of the free tier
+    for r in range(0, num_radials - 1, 3):
+        for g in range(0, num_gates - 1, 3):
             val = ref_field[r, g]
-            
             if np.ma.is_masked(val) or val < 20:
                 continue
                 
@@ -58,15 +58,13 @@ def fetch_and_compile_latest_radar():
             poly = geojson.Polygon([[p1, p2, p3, p4, p1]])
             features.append(geojson.Feature(geometry=poly, properties={"dbz": int(val)}))
             
-    print(f">>> Processing success! Compiled {len(features)} active storm polygons.")
-    
     output_path = os.path.join('public', 'latest_radar.json')
     with open(output_path, 'w') as f:
         geojson.dump(geojson.FeatureCollection(features), f)
         
     if os.path.exists(local_binary_filename):
         os.remove(local_binary_filename)
-    print(">>> Finished file write sequence. Memory cache cleared.")
+    print(">>> Finished.")
 
 if __name__ == "__main__":
     fetch_and_compile_latest_radar()
