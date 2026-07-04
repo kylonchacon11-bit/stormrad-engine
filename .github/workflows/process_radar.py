@@ -7,64 +7,44 @@ from datetime import datetime, timedelta
 from botocore.config import Config
 from botocore import UNSIGNED
 
-def fetch_and_compile_latest_radar():
-    print(">>> Connecting to NOAA AWS NEXRAD Live Bucket...")
+def fetch_and_compile():
+    print("Connecting to NOAA S3...")
     s3 = boto3.client('s3', config=Config(signature_version=UNSIGNED))
-    bucket_name = 'noaa-nexrad-level2'
-    
-    # Targeting Houston (KHGX)
+    bucket = 'noaa-nexrad-level2'
     station = 'KHGX'
     
-    # Look back 15 minutes to guarantee file availability
+    # Get files for the last 15 mins
     now = datetime.utcnow() - timedelta(minutes=15)
-    date_path = now.strftime('%Y/%m/%d')
-    prefix = f"{date_path}/{station}/{station}"
+    prefix = now.strftime('%Y/%m/%d') + f'/{station}/{station}'
     
-    objects = s3.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
-    
+    objects = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
     if 'Contents' not in objects:
-        print("!!! Error: No data found.")
         return
-        
-    latest_file_key = sorted(objects['Contents'], key=lambda x: x['LastModified'])[-1]['Key']
-    local_binary_filename = 'raw_radar.bin'
+
+    latest = sorted(objects['Contents'], key=lambda x: x['LastModified'])[-1]['Key']
+    local_file = 'radar.bin'
+    s3.download_file(bucket, latest, local_file)
     
-    print(f">>> Downloading: {latest_file_key}")
-    s3.download_file(bucket_name, latest_file_key, local_binary_filename)
-    
-    print(">>> Decoding NEXRAD Level II...")
-    radar = pyart.io.read_nexrad_archive(local_binary_filename)
-    
-    sweep_slice = radar.get_slice(0)
-    ref_field = radar.fields['reflectivity']['data'][sweep_slice]
-    gate_lat = radar.gate_latitude['data'][sweep_slice]
-    gate_lon = radar.gate_longitude['data'][sweep_slice]
+    print("Processing file...")
+    radar = pyart.io.read_nexrad_archive(local_file)
+    ref = radar.fields['reflectivity']['data'][0]
+    lats = radar.gate_latitude['data'][0]
+    lons = radar.gate_longitude['data'][0]
     
     features = []
-    num_radials, num_gates = ref_field.shape
+    # Downsample significantly to keep the file size tiny for the web browser
+    for r in range(0, ref.shape[0], 5):
+        for g in range(0, ref.shape[1], 5):
+            val = ref[r, g]
+            if not np.ma.is_masked(val) and val >= 20:
+                p = (float(lons[r,g]), float(lats[r,g]))
+                features.append(geojson.Feature(geometry=geojson.Point(p), properties={"dbz": int(val)}))
     
-    # Downsample by 3 to ensure we stay under the memory limits of the free tier
-    for r in range(0, num_radials - 1, 3):
-        for g in range(0, num_gates - 1, 3):
-            val = ref_field[r, g]
-            if np.ma.is_masked(val) or val < 20:
-                continue
-                
-            p1 = (float(gate_lon[r, g]), float(gate_lat[r, g]))
-            p2 = (float(gate_lon[r+1, g]), float(gate_lat[r+1, g]))
-            p3 = (float(gate_lon[r+1, g+1]), float(gate_lat[r+1, g+1]))
-            p4 = (float(gate_lon[r, g+1]), float(gate_lat[r, g+1]))
-            
-            poly = geojson.Polygon([[p1, p2, p3, p4, p1]])
-            features.append(geojson.Feature(geometry=poly, properties={"dbz": int(val)}))
-            
-    output_path = os.path.join('public', 'latest_radar.json')
-    with open(output_path, 'w') as f:
+    with open('public/latest_radar.json', 'w') as f:
         geojson.dump(geojson.FeatureCollection(features), f)
         
-    if os.path.exists(local_binary_filename):
-        os.remove(local_binary_filename)
-    print(">>> Finished.")
+    os.remove(local_file)
+    print("Success.")
 
 if __name__ == "__main__":
-    fetch_and_compile_latest_radar()
+    fetch_and_compile()
